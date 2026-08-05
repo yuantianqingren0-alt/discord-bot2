@@ -1,42 +1,33 @@
-"""
-荒らし対策Bot 設定ファイル
-数値やON/OFFは自由に調整してください(時間はすべてミリ秒 [ms])
-"""
+# 荒らし対策の閾値・動作設定
 
-# --- スパム(連投)検知 ---
 SPAM = {
     "enabled": True,
-    "max_messages": 5,          # この件数を超えたら発動
-    "interval_ms": 5000,        # この時間内(ms)にmax_messagesを超えると検知
-    "duplicate_threshold": 3,   # 同一内容を連続でこの回数投稿したら検知
-    "timeout_ms": 10 * 60 * 1000,  # 検知時のタイムアウト時間(10分)
-    "delete_messages": True,    # 検知したメッセージを削除するか
+    "max_messages": 5,        # 6秒間に5個以上のメッセージで検知
+    "interval_ms": 6000,      # 6000ミリ秒 = 6秒間
+    "duplicate_threshold": 5, # 同じ文面が5回連続したら検知
+    "timeout_ms": 300000,     # 5分間タイムアウト (300,000ms)
+    "delete_messages": True,  # 該当メッセージを自動削除
 }
 
-# --- メンション荒らし対策 ---
 MENTION_SPAM = {
     "enabled": True,
-    "max_mentions": 5,             # 1メッセージ内の最大メンション数
-    "timeout_ms": 15 * 60 * 1000,  # 15分タイムアウト
+    "max_mentions": 5,        # 1メッセージ内メンション5個以上で検知
+    "timeout_ms": 600000,     # 10分間タイムアウト (600,000ms)
 }
 
-# --- 招待リンクフィルター ---
-# 特定チャンネルのみ許可したい場合は /antitroll invite allow コマンドで設定してください。
 INVITE_FILTER = {
     "enabled": True,
 }
 
-# --- 大量参加(レイド)検知 ---
 ANTI_RAID = {
     "enabled": True,
-    "join_threshold": 6,             # この人数が
-    "join_interval_ms": 10000,       # この時間内(ms)に参加したらレイドとみなす
-    "action": "quarantine",          # "quarantine"(隔離ロール付与) または "kick"
-    "lockdown_ms": 5 * 60 * 1000,    # レイド検知後、新規参加者を自動処理する期間(5分)
+    "join_interval_ms": 10000, # 10秒間
+    "join_threshold": 5,       # 5人参加でレイド判定
+    "lockdown_ms": 600000,     # 10分間ロックダウン
+    "action": "quarantine",    # "quarantine" (隔離ロール付与) または "kick"
 }
 
-# --- 除外設定 ---
 WHITELIST = {
-    "exempt_admins": True,   # 管理者権限(Administrator)を持つユーザーは常に除外
-    "exempt_role_ids": [],   # 除外するロールID (例: [123456789012345678] ※必ず数値intで指定)
+    "exempt_admins": True,     # 管理者権限を持つユーザーを除外するか
+    "exempt_role_ids": [],     # 除外したいロールIDのリスト (例: [123456789012345678])
 }
