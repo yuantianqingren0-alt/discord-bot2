@@ -15,4 +15,5 @@ services:
       - key: QUARANTINE_ROLE_ID
         sync: false
       - key: SETTINGS_DATA_DIR
-        value: /tmp
+        value: ./data
+
