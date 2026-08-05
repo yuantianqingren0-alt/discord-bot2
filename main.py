@@ -1,7 +1,7 @@
 """
 Discord 荒らし対策Bot (Python / discord.py版)
 機能: /antitroll on|off|status, 招待リンク許可チャンネル管理,
-      連投/メンションスパム検知(自動タイムアウト+解除/BANボタン), レイド検知
+      連投/メンションスパム検知(自動タイムアウト+本人通知+解除/BANボタン), レイド検知
 """
 import os
 import re
@@ -87,8 +87,50 @@ async def timeout_member(member: discord.Member, ms: int, reason: str) -> bool:
         return False
 
 
+# 本人へタイムアウト理由を通知・報告する処理 (DM・チャンネル両方送信)
+async def notify_user_timeout(
+    member: discord.Member,
+    channel: discord.TextChannel,
+    minutes: int,
+    reason_text: str,
+):
+    embed = discord.Embed(
+        title="⛔ タイムアウト通知",
+        description=(
+            f"**{member.guild.name}** での規約違反（スパム行為）が検知されたため、"
+            f"アカウントを一時的にタイムアウトしました。"
+        ),
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="該当理由", value=reason_text, inline=False)
+    embed.add_field(name="制限時間", value=f"{minutes} 分間", inline=True)
+    embed.add_field(name="対象サーバー", value=member.guild.name, inline=True)
+
+    # 1. DMへ通知を送信
+    try:
+        await member.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    # 2. 該当チャンネルへ通知（5秒後に自動削除してログを綺麗に保つ）
+    try:
+        channel_embed = discord.Embed(
+            title="⚠️ タイムアウト通知",
+            description=(
+                f"{member.mention} さん、スパム行為（{reason_text}）が検知されたため "
+                f"**{minutes}分間** タイムアウトされました。"
+            ),
+            color=discord.Color.red(),
+        )
+        msg = await channel.send(content=f"{member.mention}", embed=channel_embed)
+        await msg.delete(delay=5)
+    except discord.HTTPException:
+        pass
+
+
 # ==============================
-# モデレーション用 UI View (クラス化して堅牢化)
+# モデレーション用 UI View
 # ==============================
 class ModerationView(discord.ui.View):
     def __init__(self, target_user_id: int):
@@ -205,7 +247,7 @@ async def warn_user(message: discord.Message, reason: str):
 
 
 # ==============================
-# スラッシュコマンド定義 (on_ready より前に追加)
+# スラッシュコマンド定義
 # ==============================
 antitroll_group = app_commands.Group(
     name="antitroll",
@@ -265,7 +307,6 @@ async def invite_list(interaction: discord.Interaction):
     await interaction.response.send_message(f"招待リンク許可チャンネル: {channel_list}")
 
 
-# コマンドグループを登録
 bot.tree.add_command(antitroll_group)
 
 
@@ -334,12 +375,18 @@ async def on_message(message: discord.Message):
                 )
                 if timed_out:
                     minutes = config.MENTION_SPAM["timeout_ms"] // 60000
+                    reason_desc = f"過剰なメンション行為（メンション数: {mention_count}）"
+                    
+                    # DM・チャンネル両方へ送信
+                    await notify_user_timeout(
+                        member, message.channel, minutes, reason_desc
+                    )
                     await send_moderation_prompt(
                         message,
                         member,
                         "メンション荒らしを検知",
-                        f"{member.mention} を{minutes}分間タイムアウトしました。"
-                        f"(メンション数: {mention_count})\n"
+                        f"{member.mention} を{minutes}分間タイムアウトしました。\n"
+                        f"理由: {reason_desc}\n"
                         "必要に応じて下のボタンで解除/BANしてください。",
                     )
                 return
@@ -367,19 +414,23 @@ async def on_message(message: discord.Message):
             if is_flood or is_duplicate:
                 if config.SPAM["delete_messages"]:
                     await safe_delete(message)
-                reason = "連投スパム検知" if is_flood else "同一メッセージ連投検知"
+                reason = "短時間の連投スパム" if is_flood else "同一メッセージの連続投稿"
                 timed_out = await timeout_member(
                     member, config.SPAM["timeout_ms"], reason
                 )
                 if timed_out:
                     minutes = config.SPAM["timeout_ms"] // 60000
-                    detail = "短時間の連投" if is_flood else "同一メッセージの連投"
+                    
+                    # DM・チャンネル両方へ送信
+                    await notify_user_timeout(
+                        member, message.channel, minutes, reason
+                    )
                     await send_moderation_prompt(
                         message,
                         member,
                         "スパム行為を検知",
-                        f"{member.mention} を{minutes}分間タイムアウトしました。"
-                        f"(理由: {detail})\n"
+                        f"{member.mention} を{minutes}分間タイムアウトしました。\n"
+                        f"理由: {reason}\n"
                         "必要に応じて下のボタンで解除/BANしてください。",
                     )
                 history["timestamps"] = []
@@ -388,7 +439,6 @@ async def on_message(message: discord.Message):
     except Exception as err:  # noqa: BLE001
         print("on_message処理エラー:", err)
 
-    # 他の標準コマンド処理を妨げないように実行
     await bot.process_commands(message)
 
 
@@ -449,7 +499,7 @@ async def on_member_join(member: discord.Member):
 
 
 # ==============================
-# 定期クリーンアップ(メモリリーク防止)
+# 定期クリーンアップ
 # ==============================
 @tasks.loop(seconds=30)
 async def cleanup_task():
