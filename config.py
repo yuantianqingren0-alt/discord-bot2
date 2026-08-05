@@ -21,9 +21,7 @@ MENTION_SPAM = {
 }
 
 # --- 招待リンクフィルター ---
-# 招待リンクはデフォルトで全チャンネル禁止です。
 # 特定チャンネルのみ許可したい場合は /antitroll invite allow コマンドで設定してください。
-# (許可リストは data/settings.json に保存され、ここでは編集しません)
 INVITE_FILTER = {
     "enabled": True,
 }
@@ -33,12 +31,12 @@ ANTI_RAID = {
     "enabled": True,
     "join_threshold": 6,             # この人数が
     "join_interval_ms": 10000,       # この時間内(ms)に参加したらレイドとみなす
-    "action": "quarantine",          # "quarantine"(隔離ロール付与) or "kick"
-    "lockdown_ms": 5 * 60 * 1000,    # レイド検知後、新規参加者を自動処理する期間
+    "action": "quarantine",          # "quarantine"(隔離ロール付与) または "kick"
+    "lockdown_ms": 5 * 60 * 1000,    # レイド検知後、新規参加者を自動処理する期間(5分)
 }
 
 # --- 除外設定 ---
 WHITELIST = {
     "exempt_admins": True,   # 管理者権限(Administrator)を持つユーザーは常に除外
-    "exempt_role_ids": [],   # 除外するロールID(モデレーターなど)
+    "exempt_role_ids": [],   # 除外するロールID (例: [123456789012345678] ※必ず数値intで指定)
 }
