@@ -1,7 +1,7 @@
 # Render の Blueprint(IaC)設定ファイル
-# 「New +」→「Blueprint」からこのリポジトリを選択すると、この内容で自動セットアップされます。
+# 「New +」->「Blueprint」からこのリポジトリを選択すると、この内容で自動セットアップされます。
 #
-# デフォルトは Background Worker(有料プラン、$7/月〜)を使う構成にしています。
+# デフォルトは Background Worker(有料プラン、$7/月~)を使う構成にしています。
 # 常時起動が保証され、Discord Botには最も適した方式です。
 #
 # 無料で試したい場合は、下記コメントを参考に type を web に変更し、
@@ -11,8 +11,8 @@ services:
   - type: worker
     name: discord-antitroll-bot
     env: python
-# Background Workerは無料プラン非対応。starter以上が必要
-plan: starter
+    # Background Workerは無料プラン非対応。starter以上が必要
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
