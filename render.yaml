@@ -11,7 +11,8 @@ services:
   - type: worker
     name: discord-antitroll-bot
     env: python
-    plan: starter # Background Workerは無料プラン非対応。starter以上が必要
+# Background Workerは無料プラン非対応。starter以上が必要
+plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
