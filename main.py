@@ -1,7 +1,7 @@
 """
 Discord 荒らし対策Bot (Python / discord.py版)
-機能: /antitroll on|off|status|log_channel|invite,
-      連投/メンションスパム検知(自動タイムアウト+本人通知+現場パネル設置), レイド検知
+機能: /antitroll on|off|status|invite,
+      連投/メンションスパム検知(自動タイムアウト+本人DM通知+現場パネル設置), レイド検知
 """
 import os
 import re
@@ -67,10 +67,9 @@ async def timeout_member(member: discord.Member, ms: int, reason: str) -> bool:
         return False
 
 
-# 本人へタイムアウト理由を通知する処理 (DM ＆ チャンネル5秒自滅通知)
+# 本人へタイムアウト理由をDM通知する処理（チャンネルへの投稿は削除）
 async def notify_user_timeout(
     member: discord.Member,
-    channel: discord.TextChannel,
     minutes: int,
     reason_text: str,
 ):
@@ -90,20 +89,6 @@ async def notify_user_timeout(
     try:
         await member.send(embed=embed)
     except (discord.Forbidden, discord.HTTPException):
-        pass
-
-    try:
-        channel_embed = discord.Embed(
-            title="⚠️ タイムアウト通知",
-            description=(
-                f"{member.mention} さん、スパム行為（{reason_text}）が検知されたため "
-                f"**{minutes}分間** タイムアウトされました。"
-            ),
-            color=discord.Color.red(),
-        )
-        msg = await channel.send(content=f"{member.mention}", embed=channel_embed)
-        await msg.delete(delay=5)
-    except discord.HTTPException:
         pass
 
 
@@ -192,7 +177,7 @@ class ModerationView(discord.ui.View):
             )
 
 
-# 荒らされたチャンネル（message.channel）に解散・BANパネルを設置
+# 荒らされたチャンネル（message.channel）に解除・BANパネルを設置
 async def send_moderation_prompt(
     message: discord.Message, member: discord.Member, title: str, reason_text: str
 ):
@@ -207,7 +192,6 @@ async def send_moderation_prompt(
 
     view = ModerationView(target_user_id=member.id)
     try:
-        # ログチャンネルではなく、荒らしが発生したチャンネル（message.channel）へ直接送信
         await message.channel.send(embed=embed, view=view)
     except discord.HTTPException:
         pass
@@ -343,9 +327,7 @@ async def on_message(message: discord.Message):
                     minutes = config.MENTION_SPAM["timeout_ms"] // 60000
                     reason_desc = f"過剰なメンション行為（メンション数: {mention_count}）"
 
-                    await notify_user_timeout(
-                        member, message.channel, minutes, reason_desc
-                    )
+                    await notify_user_timeout(member, minutes, reason_desc)
                     await send_moderation_prompt(
                         message,
                         member,
@@ -386,9 +368,7 @@ async def on_message(message: discord.Message):
                 if timed_out:
                     minutes = config.SPAM["timeout_ms"] // 60000
 
-                    await notify_user_timeout(
-                        member, message.channel, minutes, reason
-                    )
+                    await notify_user_timeout(member, minutes, reason)
                     await send_moderation_prompt(
                         message,
                         member,
@@ -477,5 +457,3 @@ if __name__ == "__main__":
         keep_alive()
 
     bot.run(TOKEN)
-
-
