@@ -1,7 +1,7 @@
 """
 Discord 荒らし対策Bot (Python / discord.py版)
-機能: /antitroll on|off|status, 招待リンク許可チャンネル管理,
-      連投/メンションスパム検知(自動タイムアウト+本人通知+解除/BANボタン), レイド検知
+機能: /antitroll on|off|status|log_channel|invite,
+      連投/メンションスパム検知(自動タイムアウト+本人通知+現場パネル設置), レイド検知
 """
 import os
 import re
@@ -18,8 +18,7 @@ import settings_store as settings
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")  # 任意: 指定すると起動時にそのサーバーへ即時コマンド反映
-LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID")
+GUILD_ID = os.getenv("GUILD_ID")
 QUARANTINE_ROLE_ID = os.getenv("QUARANTINE_ROLE_ID")
 
 INVITE_REGEX = re.compile(
@@ -33,11 +32,8 @@ intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# user_id -> {"timestamps": [float,...], "last_content": str, "dup_count": int}
 message_history: dict[int, dict] = {}
-# guild_id -> [float,...]
 join_history: dict[int, list] = {}
-# guild_id -> expire_timestamp(float)
 raid_lockdown: dict[int, float] = {}
 
 
@@ -53,22 +49,6 @@ def is_exempt(member: discord.Member) -> bool:
     if any(r.id in exempt_role_ids for r in member.roles):
         return True
     return False
-
-
-def get_log_channel(guild: discord.Guild):
-    if not LOG_CHANNEL_ID:
-        return None
-    return guild.get_channel(int(LOG_CHANNEL_ID))
-
-
-async def send_log(guild: discord.Guild, embed: discord.Embed):
-    channel = get_log_channel(guild)
-    if channel is None:
-        return
-    try:
-        await channel.send(embed=embed)
-    except discord.HTTPException:
-        pass
 
 
 async def safe_delete(message: discord.Message):
@@ -87,7 +67,7 @@ async def timeout_member(member: discord.Member, ms: int, reason: str) -> bool:
         return False
 
 
-# 本人へタイムアウト理由を通知・報告する処理 (DM・チャンネル両方送信)
+# 本人へタイムアウト理由を通知する処理 (DM ＆ チャンネル5秒自滅通知)
 async def notify_user_timeout(
     member: discord.Member,
     channel: discord.TextChannel,
@@ -107,13 +87,11 @@ async def notify_user_timeout(
     embed.add_field(name="制限時間", value=f"{minutes} 分間", inline=True)
     embed.add_field(name="対象サーバー", value=member.guild.name, inline=True)
 
-    # 1. DMへ通知を送信
     try:
         await member.send(embed=embed)
     except (discord.Forbidden, discord.HTTPException):
         pass
 
-    # 2. 該当チャンネルへ通知（5秒後に自動削除してログを綺麗に保つ）
     try:
         channel_embed = discord.Embed(
             title="⚠️ タイムアウト通知",
@@ -214,6 +192,7 @@ class ModerationView(discord.ui.View):
             )
 
 
+# 荒らされたチャンネル（message.channel）に解散・BANパネルを設置
 async def send_moderation_prompt(
     message: discord.Message, member: discord.Member, title: str, reason_text: str
 ):
@@ -223,27 +202,15 @@ async def send_moderation_prompt(
         color=discord.Color.red(),
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="ユーザー", value=f"{member.mention} ({member.id})", inline=True)
-    embed.add_field(name="チャンネル", value=message.channel.mention, inline=True)
+    embed.add_field(name="対象ユーザー", value=f"{member.mention} ({member.id})", inline=True)
+    embed.add_field(name="発生チャンネル", value=message.channel.mention, inline=True)
 
     view = ModerationView(target_user_id=member.id)
-    log_channel = get_log_channel(message.guild)
-    target = log_channel or message.channel
     try:
-        await target.send(embed=embed, view=view)
+        # ログチャンネルではなく、荒らしが発生したチャンネル（message.channel）へ直接送信
+        await message.channel.send(embed=embed, view=view)
     except discord.HTTPException:
         pass
-
-
-async def warn_user(message: discord.Message, reason: str):
-    embed = discord.Embed(
-        title="⚠️ メッセージを削除しました",
-        description=reason,
-        color=discord.Color.orange(),
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="ユーザー", value=message.author.mention, inline=True)
-    await send_log(message.guild, embed)
 
 
 # ==============================
@@ -276,13 +243,14 @@ async def antitroll_off(interaction: discord.Interaction):
 @antitroll_group.command(name="status", description="現在の設定状況を表示します")
 async def antitroll_status(interaction: discord.Interaction):
     s = settings.get_guild_settings(interaction.guild.id)
-    channel_list = ", ".join(f"<#{cid}>" for cid in s["allowed_invite_channels"]) or "なし"
+    invite_channels = ", ".join(f"<#{cid}>" for cid in s["allowed_invite_channels"]) or "なし"
+
     embed = discord.Embed(
         title="荒らし対策Bot ステータス",
         color=discord.Color.green() if s["enabled"] else discord.Color.greyple(),
     )
     embed.add_field(name="有効状態", value="✅ 有効" if s["enabled"] else "🛑 無効", inline=False)
-    embed.add_field(name="招待リンク許可チャンネル", value=channel_list, inline=False)
+    embed.add_field(name="招待リンク許可チャンネル", value=invite_channels, inline=False)
     await interaction.response.send_message(embed=embed)
 
 
@@ -357,16 +325,14 @@ async def on_message(message: discord.Message):
             )
             if not allowed:
                 await safe_delete(message)
-                await warn_user(
-                    message,
-                    "このチャンネルでは招待リンクの投稿は許可されていません。"
-                    "(許可チャンネルは `/antitroll invite allow` で設定できます)",
-                )
                 return
 
-        # --- メンション荒らし対策 ---
+        # --- メンション荒らし対策（@everyone / @here 対応版） ---
         if config.MENTION_SPAM["enabled"]:
             mention_count = len(message.mentions) + len(message.role_mentions)
+            if message.mention_everyone:
+                mention_count += 1
+
             if mention_count >= config.MENTION_SPAM["max_mentions"]:
                 if config.SPAM["delete_messages"]:
                     await safe_delete(message)
@@ -376,8 +342,7 @@ async def on_message(message: discord.Message):
                 if timed_out:
                     minutes = config.MENTION_SPAM["timeout_ms"] // 60000
                     reason_desc = f"過剰なメンション行為（メンション数: {mention_count}）"
-                    
-                    # DM・チャンネル両方へ送信
+
                     await notify_user_timeout(
                         member, message.channel, minutes, reason_desc
                     )
@@ -420,8 +385,7 @@ async def on_message(message: discord.Message):
                 )
                 if timed_out:
                     minutes = config.SPAM["timeout_ms"] // 60000
-                    
-                    # DM・チャンネル両方へ送信
+
                     await notify_user_timeout(
                         member, message.channel, minutes, reason
                     )
@@ -467,20 +431,6 @@ async def on_member_join(member: discord.Member):
         in_lockdown = lockdown_expire is not None and lockdown_expire > now
 
         if len(history) >= config.ANTI_RAID["join_threshold"] or in_lockdown:
-            if not in_lockdown:
-                lockdown_sec = config.ANTI_RAID["lockdown_ms"] / 1000
-                raid_lockdown[guild_id] = now + lockdown_sec
-                embed = discord.Embed(
-                    title="🚨 大量参加(レイド)を検知",
-                    description=(
-                        f"{int(interval_sec)}秒間に{len(history)}人が参加しました。"
-                        f"{int(lockdown_sec // 60)}分間、新規参加者を自動処理します。"
-                    ),
-                    color=discord.Color.red(),
-                    timestamp=datetime.now(timezone.utc),
-                )
-                await send_log(member.guild, embed)
-
             if config.ANTI_RAID["action"] == "kick":
                 try:
                     await member.kick(reason="レイド対策: 自動キック")
@@ -507,7 +457,9 @@ async def cleanup_task():
     interval_sec = config.SPAM["interval_ms"] / 1000
     for user_id in list(message_history.keys()):
         history = message_history[user_id]
-        history["timestamps"] = [t for t in history["timestamps"] if now - t < interval_sec]
+        history["timestamps"] = [
+            t for t in history["timestamps"] if now - t < interval_sec
+        ]
         if not history["timestamps"]:
             del message_history[user_id]
     for guild_id in list(raid_lockdown.keys()):
@@ -525,4 +477,5 @@ if __name__ == "__main__":
         keep_alive()
 
     bot.run(TOKEN)
+
 
