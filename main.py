@@ -17,16 +17,14 @@ def home():
     return "Bot is live and running!"
 
 def run_flask():
-    # Renderが割り当てるPORT番号（デフォルト10000/8080等）を取得して起動
     port = int(os.getenv("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# スレッドで裏でWebサーバーを起動（ポート検出エラーを防ぐ）
 threading.Thread(target=run_flask, daemon=True).start()
 
 
 # ==========================================
-# 設定データの管理 (settings_store との連携)
+# 設定データの管理 (settings.json との連携)
 # ==========================================
 SETTINGS_FILE = "settings.json"
 
@@ -163,23 +161,19 @@ async def apply_moderation(message: discord.Message, reason: str):
     member = message.author
     settings = get_guild_setting(guild.id)
 
-    # タイムアウト時間の決定 (厳格モード: 1時間 / マイルドモード: 10分)
     duration_minutes = 60 if settings.get("mode") == "strict" else 10
     until = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
 
-    # 1. 違反メッセージの削除
     try:
         await message.delete()
     except Exception:
         pass
 
-    # 2. タイムアウト処理
     try:
         await member.timeout(until, reason=reason)
     except Exception as e:
         print(f"タイムアウト失敗: {e}")
 
-    # 3. 本人へのDM通知
     try:
         dm_embed = discord.Embed(
             title="⚠️ 自動モデレーション通知",
@@ -192,7 +186,6 @@ async def apply_moderation(message: discord.Message, reason: str):
     except Exception:
         pass
 
-    # 4. 現場チャンネルへのパネル設置
     panel_embed = discord.Embed(
         title="🛡️ 自動対処ログ・モデレーションパネル",
         description=f"{member.mention} による違反行為を検知し、タイムアウトを実施しました。",
@@ -204,7 +197,6 @@ async def apply_moderation(message: discord.Message, reason: str):
     view = ModerationPanelView(target_member=member)
     await message.channel.send(embed=panel_embed, view=view)
 
-    # 5. 専用ログチャンネルへの自動送信
     await send_action_log(
         guild=guild,
         title="自動タイムアウト",
@@ -229,7 +221,6 @@ async def on_message(message: discord.Message):
     if not settings.get("enabled"):
         return
 
-    # 管理者権限持ちは除外
     if message.author.guild_permissions.administrator:
         return
 
@@ -253,7 +244,6 @@ async def on_message(message: discord.Message):
         user_message_history[uid] = []
     
     user_message_history[uid].append(now)
-    # 3秒以内のメッセージに絞り込み
     user_message_history[uid] = [t for t in user_message_history[uid] if (now - t).total_seconds() <= 3]
 
     if len(user_message_history[uid]) >= 4:
@@ -273,7 +263,6 @@ async def on_member_join(member: discord.Member):
     now = datetime.now(timezone.utc)
     join_history.append(now)
 
-    # 10秒以内に10人以上の参加でレイド（襲撃）と判断
     recent_joins = [t for t in join_history if (now - t).total_seconds() <= 10]
     if len(recent_joins) >= 10:
         try:
@@ -329,16 +318,65 @@ async def logset_cmd(interaction: discord.Interaction, channel: discord.TextChan
     save_settings()
     await interaction.response.send_message(f"✅ {msg}", ephemeral=True)
 
+# ------------------------------------------
+# 復元: 招待リンク許可チャンネル管理コマンド
+# ------------------------------------------
+@antitroll_group.command(name="allow_invite", description="指定したチャンネルでのDiscord招待リンク送信を許可します")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(channel="許可するテキストチャンネル")
+async def allow_invite_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+    s = get_guild_setting(interaction.guild_id)
+    allowed = s.setdefault("allowed_invite_channels", [])
+    if channel.id not in allowed:
+        allowed.append(channel.id)
+        save_settings()
+        await interaction.response.send_message(f"✅ {channel.mention} でのDiscord招待リンク送信を許可しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"ℹ️ {channel.mention} は既に許可されています。", ephemeral=True)
+
+@antitroll_group.command(name="deny_invite", description="指定したチャンネルのDiscord招待リンク送信許可を解除します")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(channel="許可を解除するテキストチャンネル")
+async def deny_invite_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+    s = get_guild_setting(interaction.guild_id)
+    allowed = s.setdefault("allowed_invite_channels", [])
+    if channel.id in allowed:
+        allowed.remove(channel.id)
+        save_settings()
+        await interaction.response.send_message(f"✅ {channel.mention} の招待リンク許可を解除しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"ℹ️ {channel.mention} は許可リストに登録されていません。", ephemeral=True)
+
+@antitroll_group.command(name="list_invites", description="招待リンクの送信が許可されているチャンネル一覧を表示します")
+@app_commands.checks.has_permissions(administrator=True)
+async def list_invites_cmd(interaction: discord.Interaction):
+    s = get_guild_setting(interaction.guild_id)
+    allowed_ids = s.get("allowed_invite_channels", [])
+    if not allowed_ids:
+        await interaction.response.send_message("ℹ️ 招待リンクが許可されているチャンネルはありません。（全テキストチャンネルで禁止中）", ephemeral=True)
+        return
+
+    mentions = [f"<#{cid}>" for cid in allowed_ids]
+    embed = discord.Embed(
+        title="🔗 招待リンク許可チャンネル一覧",
+        description="\n".join(mentions),
+        color=discord.Color.blue()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @antitroll_group.command(name="status", description="現在の設定状態を表示します")
 @app_commands.checks.has_permissions(administrator=True)
 async def status_cmd(interaction: discord.Interaction):
     s = get_guild_setting(interaction.guild_id)
     log_ch = f"<#{s['log_channel_id']}>" if s.get("log_channel_id") else "未設定"
+    allowed_ids = s.get("allowed_invite_channels", [])
+    allowed_str = f"{len(allowed_ids)} 個のチャンネル" if allowed_ids else "なし (全禁止)"
     
     embed = discord.Embed(title="🛡️ AntiTroll 設定ステータス", color=discord.Color.blue())
     embed.add_field(name="機能状態", value="有効 🟢" if s["enabled"] else "無効 🔴", inline=False)
     embed.add_field(name="動作モード", value="厳格 (60分)" if s["mode"] == "strict" else "マイルド (10分)", inline=False)
     embed.add_field(name="ログチャンネル", value=log_ch, inline=False)
+    embed.add_field(name="招待リンク許可数", value=allowed_str, inline=False)
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -346,7 +384,7 @@ tree.add_command(antitroll_group)
 
 
 # ==========================================
-# 追加コマンド (/purge, /userinfo, /lockdown)
+# 追加管理コマンド (/purge, /userinfo, /lockdown)
 # ==========================================
 @tree.command(name="purge", description="指定した数のメッセージを一括削除します")
 @app_commands.checks.has_permissions(manage_messages=True)
