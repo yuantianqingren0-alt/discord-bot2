@@ -1,9 +1,29 @@
 import os
 import json
+import threading
+from flask import Flask
 import discord
 from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone, timedelta
+
+# ==========================================
+# Render (Web Service) ポート開通用 Flask設定
+# ==========================================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is live and running!"
+
+def run_flask():
+    # Renderが割り当てるPORT番号（デフォルト10000/8080等）を取得して起動
+    port = int(os.getenv("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# スレッドで裏でWebサーバーを起動（ポート検出エラーを防ぐ）
+threading.Thread(target=run_flask, daemon=True).start()
+
 
 # ==========================================
 # 設定データの管理 (settings_store との連携)
