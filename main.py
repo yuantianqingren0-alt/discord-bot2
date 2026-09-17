@@ -1,459 +1,486 @@
-"""
-Discord 荒らし対策Bot (Python / discord.py版)
-機能: /antitroll on|off|status|invite,
-      連投/メンションスパム検知(自動タイムアウト+本人DM通知+現場パネル設置), レイド検知
-"""
 import os
-import re
-from datetime import datetime, timedelta, timezone
-
+import json
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
-from dotenv import load_dotenv
+from discord.ext import commands
+from datetime import datetime, timezone, timedelta
 
-import config
-import settings_store as settings
+# ==========================================
+# 設定データの管理 (settings_store との連携)
+# ==========================================
+SETTINGS_FILE = "settings.json"
 
-load_dotenv()
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")
-QUARANTINE_ROLE_ID = os.getenv("QUARANTINE_ROLE_ID")
+def save_settings():
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(guild_settings, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"設定保存エラー: {e}")
 
-INVITE_REGEX = re.compile(
-    r"(discord\.gg|discord(?:app)?\.com/invite)/[a-zA-Z0-9-]+", re.IGNORECASE
-)
+guild_settings = load_settings()
 
+def get_guild_setting(guild_id: int):
+    gid = str(guild_id)
+    if gid not in guild_settings:
+        guild_settings[gid] = {
+            "enabled": True,
+            "mode": "strict",  # default: strict / gentle
+            "log_channel_id": None,
+            "allowed_invite_channels": []
+        }
+        save_settings()
+    return guild_settings[gid]
+
+
+# ==========================================
+# Bot基本設定
+# ==========================================
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-intents.guilds = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+class AntiTrollBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
 
-message_history: dict[int, dict] = {}
-join_history: dict[int, list] = {}
-raid_lockdown: dict[int, float] = {}
+    async def setup_hook(self):
+        await self.tree.sync()
+        print("スラッシュコマンドを同期しました。")
 
-
-# ==============================
-# ユーティリティ
-# ==============================
-def is_exempt(member: discord.Member) -> bool:
-    if member is None:
-        return False
-    if config.WHITELIST.get("exempt_admins") and member.guild_permissions.administrator:
-        return True
-    exempt_role_ids = config.WHITELIST.get("exempt_role_ids", [])
-    if any(r.id in exempt_role_ids for r in member.roles):
-        return True
-    return False
+bot = AntiTrollBot()
+tree = bot.tree
 
 
-async def safe_delete(message: discord.Message):
+# ==========================================
+# 共通処理: 処理ログの送信機能
+# ==========================================
+async def send_action_log(guild: discord.Guild, title: str, user: discord.User, reason: str, color: discord.Color):
+    settings = get_guild_setting(guild.id)
+    log_channel_id = settings.get("log_channel_id")
+    if not log_channel_id:
+        return
+
+    log_channel = guild.get_channel(log_channel_id)
+    if not log_channel:
+        return
+
+    embed = discord.Embed(
+        title=f"🛡️ モデレーションログ: {title}",
+        color=color,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="対象ユーザー / 実行者", value=f"{user.mention} (`{user.id}`)", inline=False)
+    embed.add_field(name="詳細 / 理由", value=reason, inline=False)
+    embed.set_footer(text=f"Guild ID: {guild.id}")
+
+    try:
+        await log_channel.send(embed=embed)
+    except Exception:
+        pass
+
+
+# ==========================================
+# モデレーションパネル（解除・BANボタン）
+# ==========================================
+class ModerationPanelView(discord.ui.View):
+    def __init__(self, target_member: discord.Member):
+        super().__init__(timeout=None)
+        self.target_member = target_member
+
+    @discord.ui.button(label="タイムアウト解除", style=discord.ButtonStyle.green, custom_id="untimeout_btn")
+    async def untimeout_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.moderate_members:
+            await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
+            return
+
+        try:
+            await self.target_member.timeout(None, reason=f"{interaction.user} による手動解除")
+            await interaction.response.send_message(f"✅ {self.target_member.mention} のタイムアウトを解除しました。")
+            await send_action_log(
+                guild=interaction.guild,
+                title="タイムアウト解除",
+                user=self.target_member,
+                reason=f"実行者: {interaction.user.mention}",
+                color=discord.Color.green()
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ 解除に失敗しました: {e}", ephemeral=True)
+
+    @discord.ui.button(label="BAN（永久追放）", style=discord.ButtonStyle.danger, custom_id="ban_btn")
+    async def ban_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.ban_members:
+            await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
+            return
+
+        try:
+            await self.target_member.ban(reason=f"{interaction.user} による手動BAN")
+            await interaction.response.send_message(f"🔨 {self.target_member.mention} をBANしました。")
+            await send_action_log(
+                guild=interaction.guild,
+                title="BAN実行",
+                user=self.target_member,
+                reason=f"実行者: {interaction.user.mention}",
+                color=discord.Color.red()
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ BANに失敗しました: {e}", ephemeral=True)
+
+
+# ==========================================
+# モデレーション実行処理 (タイムアウト+DM+現場設置)
+# ==========================================
+async def apply_moderation(message: discord.Message, reason: str):
+    guild = message.guild
+    member = message.author
+    settings = get_guild_setting(guild.id)
+
+    # タイムアウト時間の決定 (厳格モード: 1時間 / マイルドモード: 10分)
+    duration_minutes = 60 if settings.get("mode") == "strict" else 10
+    until = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
+
+    # 1. 違反メッセージの削除
     try:
         await message.delete()
-    except discord.HTTPException:
+    except Exception:
         pass
 
-
-async def timeout_member(member: discord.Member, ms: int, reason: str) -> bool:
+    # 2. タイムアウト処理
     try:
-        await member.timeout(timedelta(milliseconds=ms), reason=reason)
-        return True
-    except (discord.Forbidden, discord.HTTPException) as err:
-        print(f"タイムアウト処理エラー: {err}")
-        return False
+        await member.timeout(until, reason=reason)
+    except Exception as e:
+        print(f"タイムアウト失敗: {e}")
 
-
-# 本人へタイムアウト理由をDM通知する処理（チャンネルへの投稿は削除）
-async def notify_user_timeout(
-    member: discord.Member,
-    minutes: int,
-    reason_text: str,
-):
-    embed = discord.Embed(
-        title="⛔ タイムアウト通知",
-        description=(
-            f"**{member.guild.name}** での規約違反（スパム行為）が検知されたため、"
-            f"アカウントを一時的にタイムアウトしました。"
-        ),
-        color=discord.Color.red(),
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="該当理由", value=reason_text, inline=False)
-    embed.add_field(name="制限時間", value=f"{minutes} 分間", inline=True)
-    embed.add_field(name="対象サーバー", value=member.guild.name, inline=True)
-
+    # 3. 本人へのDM通知
     try:
-        await member.send(embed=embed)
-    except (discord.Forbidden, discord.HTTPException):
-        pass
-
-
-# ==============================
-# モデレーション用 UI View
-# ==============================
-class ModerationView(discord.ui.View):
-    def __init__(self, target_user_id: int):
-        super().__init__(timeout=None)
-        self.target_user_id = target_user_id
-
-    async def _check_permission(self, interaction: discord.Interaction) -> bool:
-        perms = (
-            interaction.channel.permissions_for(interaction.user)
-            if interaction.channel
-            else None
+        dm_embed = discord.Embed(
+            title="⚠️ 自動モデレーション通知",
+            description=f"**{guild.name}** にて利用規約違反が検知されたため、一時的にタイムアウト処理が行われました。",
+            color=discord.Color.gold()
         )
-        if not (perms and (perms.moderate_members or perms.administrator)):
-            await interaction.response.send_message(
-                "この操作を行う権限がありません。", ephemeral=True
-            )
-            return False
-        return True
-
-    def _disable_all_buttons(self):
-        for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                item.disabled = True
-
-    @discord.ui.button(label="タイムアウト解除", style=discord.ButtonStyle.success)
-    async def untimeout_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        if not await self._check_permission(interaction):
-            return
-
-        guild = interaction.guild
-        try:
-            target = guild.get_member(self.target_user_id) or await guild.fetch_member(
-                self.target_user_id
-            )
-            await target.timeout(None, reason=f"解除実行者: {interaction.user}")
-            await interaction.response.send_message(
-                f"✅ {target.mention} のタイムアウトを {interaction.user.mention} が解除しました。"
-            )
-            self._disable_all_buttons()
-            if interaction.message:
-                await interaction.message.edit(view=self)
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "Botの権限不足のため操作できませんでした。(ロール順位を確認してください)",
-                ephemeral=True,
-            )
-        except Exception as err:
-            await interaction.response.send_message(
-                f"操作に失敗しました: {err}", ephemeral=True
-            )
-
-    @discord.ui.button(label="BAN", style=discord.ButtonStyle.danger)
-    async def ban_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        if not await self._check_permission(interaction):
-            return
-
-        guild = interaction.guild
-        try:
-            target = guild.get_member(self.target_user_id) or await guild.fetch_member(
-                self.target_user_id
-            )
-            await target.ban(reason=f"BAN実行者: {interaction.user}(荒らし対策ボタン経由)")
-            await interaction.response.send_message(
-                f"🔨 {target} を {interaction.user.mention} がBANしました。"
-            )
-            self._disable_all_buttons()
-            if interaction.message:
-                await interaction.message.edit(view=self)
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "Botの権限不足のため操作できませんでした。(ロール順位を確認してください)",
-                ephemeral=True,
-            )
-        except Exception as err:
-            await interaction.response.send_message(
-                f"操作に失敗しました: {err}", ephemeral=True
-            )
-
-
-# 荒らされたチャンネル（message.channel）に解除・BANパネルを設置
-async def send_moderation_prompt(
-    message: discord.Message, member: discord.Member, title: str, reason_text: str
-):
-    embed = discord.Embed(
-        title=f"🚨 {title}",
-        description=reason_text,
-        color=discord.Color.red(),
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="対象ユーザー", value=f"{member.mention} ({member.id})", inline=True)
-    embed.add_field(name="発生チャンネル", value=message.channel.mention, inline=True)
-
-    view = ModerationView(target_user_id=member.id)
-    try:
-        await message.channel.send(embed=embed, view=view)
-    except discord.HTTPException:
+        dm_embed.add_field(name="理由", value=reason, inline=False)
+        dm_embed.add_field(name="解除予定時刻", value=f"<t:{int(until.timestamp())}:R>", inline=False)
+        await member.send(embed=dm_embed)
+    except Exception:
         pass
 
-
-# ==============================
-# スラッシュコマンド定義
-# ==============================
-antitroll_group = app_commands.Group(
-    name="antitroll",
-    description="荒らし対策Botの設定",
-    default_permissions=discord.Permissions(manage_guild=True),
-)
-invite_group = app_commands.Group(
-    name="invite",
-    description="招待リンクの許可チャンネル設定",
-    parent=antitroll_group,
-)
-
-
-@antitroll_group.command(name="on", description="このサーバーで荒らし対策を有効化します")
-async def antitroll_on(interaction: discord.Interaction):
-    settings.set_enabled(interaction.guild.id, True)
-    await interaction.response.send_message("✅ 荒らし対策を**有効化**しました。")
-
-
-@antitroll_group.command(name="off", description="このサーバーで荒らし対策を無効化します")
-async def antitroll_off(interaction: discord.Interaction):
-    settings.set_enabled(interaction.guild.id, False)
-    await interaction.response.send_message("🛑 荒らし対策を**無効化**しました。")
-
-
-@antitroll_group.command(name="status", description="現在の設定状況を表示します")
-async def antitroll_status(interaction: discord.Interaction):
-    s = settings.get_guild_settings(interaction.guild.id)
-    invite_channels = ", ".join(f"<#{cid}>" for cid in s["allowed_invite_channels"]) or "なし"
-
-    embed = discord.Embed(
-        title="荒らし対策Bot ステータス",
-        color=discord.Color.green() if s["enabled"] else discord.Color.greyple(),
+    # 4. 現場チャンネルへのパネル設置
+    panel_embed = discord.Embed(
+        title="🛡️ 自動対処ログ・モデレーションパネル",
+        description=f"{member.mention} による違反行為を検知し、タイムアウトを実施しました。",
+        color=discord.Color.red()
     )
-    embed.add_field(name="有効状態", value="✅ 有効" if s["enabled"] else "🛑 無効", inline=False)
-    embed.add_field(name="招待リンク許可チャンネル", value=invite_channels, inline=False)
-    await interaction.response.send_message(embed=embed)
+    panel_embed.add_field(name="理由", value=reason, inline=True)
+    panel_embed.add_field(name="処罰時間", value=f"{duration_minutes} 分間", inline=True)
+    
+    view = ModerationPanelView(target_member=member)
+    await message.channel.send(embed=panel_embed, view=view)
+
+    # 5. 専用ログチャンネルへの自動送信
+    await send_action_log(
+        guild=guild,
+        title="自動タイムアウト",
+        user=member,
+        reason=f"発生チャンネル: {message.channel.mention}\n理由: {reason}\n処罰: {duration_minutes}分タイムアウト",
+        color=discord.Color.orange()
+    )
 
 
-@invite_group.command(name="allow", description="指定チャンネルで招待リンクの投稿を許可します")
-@app_commands.describe(channel="許可するチャンネル")
-async def invite_allow(interaction: discord.Interaction, channel: discord.TextChannel):
-    settings.allow_invite_channel(interaction.guild.id, channel.id)
-    await interaction.response.send_message(f"✅ {channel.mention} で招待リンクの投稿を許可しました。")
+# ==========================================
+# イベント検知 (スパム・招待・レイド)
+# ==========================================
+user_message_history = {}
+join_history = []
 
-
-@invite_group.command(name="disallow", description="指定チャンネルの招待リンク許可を解除します")
-@app_commands.describe(channel="解除するチャンネル")
-async def invite_disallow(interaction: discord.Interaction, channel: discord.TextChannel):
-    settings.disallow_invite_channel(interaction.guild.id, channel.id)
-    await interaction.response.send_message(f"🛑 {channel.mention} の招待リンク許可を解除しました。")
-
-
-@invite_group.command(name="list", description="招待リンクが許可されているチャンネル一覧")
-async def invite_list(interaction: discord.Interaction):
-    s = settings.get_guild_settings(interaction.guild.id)
-    channel_list = ", ".join(f"<#{cid}>" for cid in s["allowed_invite_channels"]) or "なし"
-    await interaction.response.send_message(f"招待リンク許可チャンネル: {channel_list}")
-
-
-bot.tree.add_command(antitroll_group)
-
-
-# ==============================
-# イベント: 起動時
-# ==============================
-@bot.event
-async def on_ready():
-    print(f"ログイン完了: {bot.user}")
-    try:
-        if GUILD_ID:
-            guild_obj = discord.Object(id=int(GUILD_ID))
-            bot.tree.copy_global_to(guild=guild_obj)
-            synced = await bot.tree.sync(guild=guild_obj)
-            print(f"ギルド({GUILD_ID})にコマンドを{len(synced)}件同期しました(即時反映)")
-        else:
-            synced = await bot.tree.sync()
-            print(f"グローバルコマンドを{len(synced)}件同期しました(反映まで最大1時間)")
-    except discord.HTTPException as err:
-        print("コマンド同期エラー:", err)
-
-    if not cleanup_task.is_running():
-        cleanup_task.start()
-
-
-# ==============================
-# イベント: メッセージ監視
-# ==============================
 @bot.event
 async def on_message(message: discord.Message):
-    try:
-        if message.author.bot or message.guild is None:
+    if message.author.bot or not message.guild:
+        return
+
+    settings = get_guild_setting(message.guild.id)
+    if not settings.get("enabled"):
+        return
+
+    # 管理者権限持ちは除外
+    if message.author.guild_permissions.administrator:
+        return
+
+    now = datetime.now(timezone.utc)
+
+    # --- A. 招待リンクフィルター ---
+    if "discord.gg/" in message.content or "discord.com/invite/" in message.content:
+        allowed_channels = settings.get("allowed_invite_channels", [])
+        if message.channel.id not in allowed_channels:
+            await apply_moderation(message, "許可されていないチャンネルでのDiscord招待リンク送信")
             return
-        if not settings.is_enabled(message.guild.id):
-            return
 
-        member = message.author
-        if is_exempt(member):
-            return
+    # --- B. メンションスパム検知 (5人以上) ---
+    if len(message.mentions) >= 5:
+        await apply_moderation(message, "大量メンション（5人以上）によるスパム行為")
+        return
 
-        now = datetime.now(timezone.utc).timestamp()
-        user_id = member.id
+    # --- C. 連投スパム検知 (3秒以内に4通) ---
+    uid = message.author.id
+    if uid not in user_message_history:
+        user_message_history[uid] = []
+    
+    user_message_history[uid].append(now)
+    # 3秒以内のメッセージに絞り込み
+    user_message_history[uid] = [t for t in user_message_history[uid] if (now - t).total_seconds() <= 3]
 
-        # --- 招待リンクフィルター ---
-        if config.INVITE_FILTER["enabled"] and INVITE_REGEX.search(message.content or ""):
-            allowed = settings.is_invite_allowed_in_channel(
-                message.guild.id, message.channel.id
-            )
-            if not allowed:
-                await safe_delete(message)
-                return
-
-        # --- メンション荒らし対策（@everyone / @here 対応版） ---
-        if config.MENTION_SPAM["enabled"]:
-            mention_count = len(message.mentions) + len(message.role_mentions)
-            if message.mention_everyone:
-                mention_count += 1
-
-            if mention_count >= config.MENTION_SPAM["max_mentions"]:
-                if config.SPAM["delete_messages"]:
-                    await safe_delete(message)
-                timed_out = await timeout_member(
-                    member, config.MENTION_SPAM["timeout_ms"], "メンション荒らし検知"
-                )
-                if timed_out:
-                    minutes = config.MENTION_SPAM["timeout_ms"] // 60000
-                    reason_desc = f"過剰なメンション行為（メンション数: {mention_count}）"
-
-                    await notify_user_timeout(member, minutes, reason_desc)
-                    await send_moderation_prompt(
-                        message,
-                        member,
-                        "メンション荒らしを検知",
-                        f"{member.mention} を{minutes}分間タイムアウトしました。\n"
-                        f"理由: {reason_desc}\n"
-                        "必要に応じて下のボタンで解除/BANしてください。",
-                    )
-                return
-
-        # --- 連投・スパム検知 ---
-        if config.SPAM["enabled"]:
-            history = message_history.setdefault(
-                user_id, {"timestamps": [], "last_content": "", "dup_count": 0}
-            )
-            interval_sec = config.SPAM["interval_ms"] / 1000
-            history["timestamps"] = [
-                t for t in history["timestamps"] if now - t < interval_sec
-            ]
-            history["timestamps"].append(now)
-
-            if message.content and message.content == history["last_content"]:
-                history["dup_count"] += 1
-            else:
-                history["dup_count"] = 1
-                history["last_content"] = message.content
-
-            is_flood = len(history["timestamps"]) > config.SPAM["max_messages"]
-            is_duplicate = history["dup_count"] >= config.SPAM["duplicate_threshold"]
-
-            if is_flood or is_duplicate:
-                if config.SPAM["delete_messages"]:
-                    await safe_delete(message)
-                reason = "短時間の連投スパム" if is_flood else "同一メッセージの連続投稿"
-                timed_out = await timeout_member(
-                    member, config.SPAM["timeout_ms"], reason
-                )
-                if timed_out:
-                    minutes = config.SPAM["timeout_ms"] // 60000
-
-                    await notify_user_timeout(member, minutes, reason)
-                    await send_moderation_prompt(
-                        message,
-                        member,
-                        "スパム行為を検知",
-                        f"{member.mention} を{minutes}分間タイムアウトしました。\n"
-                        f"理由: {reason}\n"
-                        "必要に応じて下のボタンで解除/BANしてください。",
-                    )
-                history["timestamps"] = []
-                history["dup_count"] = 0
-
-    except Exception as err:  # noqa: BLE001
-        print("on_message処理エラー:", err)
+    if len(user_message_history[uid]) >= 4:
+        user_message_history[uid] = []
+        await apply_moderation(message, "短時間での大量メッセージ連投スパム")
+        return
 
     await bot.process_commands(message)
 
 
-# ==============================
-# イベント: 大量参加(レイド)検知
-# ==============================
 @bot.event
 async def on_member_join(member: discord.Member):
+    settings = get_guild_setting(member.guild.id)
+    if not settings.get("enabled"):
+        return
+
+    now = datetime.now(timezone.utc)
+    join_history.append(now)
+
+    # 10秒以内に10人以上の参加でレイド（襲撃）と判断
+    recent_joins = [t for t in join_history if (now - t).total_seconds() <= 10]
+    if len(recent_joins) >= 10:
+        try:
+            await member.timeout(timedelta(hours=24), reason="自動レイド対策機能作動")
+            await send_action_log(
+                guild=member.guild,
+                title="🚨 レイド対策発動",
+                user=member,
+                reason="10秒以内に10人以上の大量参加を検知したため、新規参加者を保護のため自動タイムアウトしました。",
+                color=discord.Color.dark_red()
+            )
+        except Exception:
+            pass
+
+
+# ==========================================
+# スラッシュコマンド群 (/antitroll)
+# ==========================================
+antitroll_group = app_commands.Group(name="antitroll", description="AntiTroll Botの設定コマンド")
+
+@antitroll_group.command(name="toggle", description="Botの有効化/無効化を切り替えます")
+@app_commands.checks.has_permissions(administrator=True)
+async def toggle_cmd(interaction: discord.Interaction):
+    s = get_guild_setting(interaction.guild_id)
+    s["enabled"] = not s["enabled"]
+    save_settings()
+    status = "有効 🟢" if s["enabled"] else "無効 🔴"
+    await interaction.response.send_message(f"AntiTroll 機能を **{status}** に変更しました。", ephemeral=True)
+
+@antitroll_group.command(name="mode", description="動作モードを変更します")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.choices(mode=[
+    app_commands.Choice(name="厳格モード (60分タイムアウト)", value="strict"),
+    app_commands.Choice(name="マイルドモード (10分タイムアウト)", value="gentle")
+])
+async def mode_cmd(interaction: discord.Interaction, mode: app_commands.Choice[str]):
+    s = get_guild_setting(interaction.guild_id)
+    s["mode"] = mode.value
+    save_settings()
+    await interaction.response.send_message(f"動作モードを **{mode.name}** に設定しました。", ephemeral=True)
+
+@antitroll_group.command(name="logset", description="対処ログを送信するチャンネルを設定/解除します")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(channel="ログ宛先のテキストチャンネル（未指定で解除）")
+async def logset_cmd(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    s = get_guild_setting(interaction.guild_id)
+    if channel:
+        s["log_channel_id"] = channel.id
+        msg = f"対処ログの送信先を {channel.mention} に設定しました。"
+    else:
+        s["log_channel_id"] = None
+        msg = "対処ログの送信先設定を解除しました。"
+    save_settings()
+    await interaction.response.send_message(f"✅ {msg}", ephemeral=True)
+
+@antitroll_group.command(name="status", description="現在の設定状態を表示します")
+@app_commands.checks.has_permissions(administrator=True)
+async def status_cmd(interaction: discord.Interaction):
+    s = get_guild_setting(interaction.guild_id)
+    log_ch = f"<#{s['log_channel_id']}>" if s.get("log_channel_id") else "未設定"
+    
+    embed = discord.Embed(title="🛡️ AntiTroll 設定ステータス", color=discord.Color.blue())
+    embed.add_field(name="機能状態", value="有効 🟢" if s["enabled"] else "無効 🔴", inline=False)
+    embed.add_field(name="動作モード", value="厳格 (60分)" if s["mode"] == "strict" else "マイルド (10分)", inline=False)
+    embed.add_field(name="ログチャンネル", value=log_ch, inline=False)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+tree.add_command(antitroll_group)
+
+
+# ==========================================
+# 追加コマンド (/purge, /userinfo, /lockdown)
+# ==========================================
+@tree.command(name="purge", description="指定した数のメッセージを一括削除します")
+@app_commands.checks.has_permissions(manage_messages=True)
+@app_commands.describe(
+    amount="削除するメッセージ数 (1~100)",
+    target="特定のユーザーのメッセージのみ削除したい場合に指定"
+)
+async def purge_command(
+    interaction: discord.Interaction, 
+    amount: app_commands.Range[int, 1, 100], 
+    target: discord.Member = None
+):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ このコマンドはサーバー内でのみ実行できます。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    channel = interaction.channel
+
+    def check(msg):
+        if target:
+            return msg.author.id == target.id
+        return True
+
     try:
-        if not config.ANTI_RAID["enabled"]:
-            return
-        if not settings.is_enabled(member.guild.id):
-            return
-
-        guild_id = member.guild.id
-        now = datetime.now(timezone.utc).timestamp()
-        interval_sec = config.ANTI_RAID["join_interval_ms"] / 1000
-
-        history = [
-            t for t in join_history.get(guild_id, []) if now - t < interval_sec
-        ]
-        history.append(now)
-        join_history[guild_id] = history
-
-        lockdown_expire = raid_lockdown.get(guild_id)
-        in_lockdown = lockdown_expire is not None and lockdown_expire > now
-
-        if len(history) >= config.ANTI_RAID["join_threshold"] or in_lockdown:
-            if config.ANTI_RAID["action"] == "kick":
-                try:
-                    await member.kick(reason="レイド対策: 自動キック")
-                except discord.HTTPException:
-                    pass
-            else:
-                if QUARANTINE_ROLE_ID:
-                    role = member.guild.get_role(int(QUARANTINE_ROLE_ID))
-                    if role:
-                        try:
-                            await member.add_roles(role, reason="レイド対策: 隔離ロール付与")
-                        except discord.HTTPException:
-                            pass
-    except Exception as err:  # noqa: BLE001
-        print("on_member_join処理エラー:", err)
+        deleted = await channel.purge(limit=amount, check=check)
+        count = len(deleted)
+        
+        target_str = f" ({target.mention} のみ)" if target else ""
+        await interaction.followup.send(f"🧹 {count} 件のメッセージを削除しました。{target_str}", ephemeral=True)
+        
+        await send_action_log(
+            guild=interaction.guild,
+            title="🧹 メッセージ一括削除",
+            user=interaction.user,
+            reason=f"{channel.mention} で {count} 件のメッセージを削除{target_str}",
+            color=discord.Color.blue()
+        )
+    except discord.Forbidden:
+        await interaction.followup.send("❌ Botに「メッセージの管理」権限が付与されていません。", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ 削除中にエラーが発生しました: {e}", ephemeral=True)
 
 
-# ==============================
-# 定期クリーンアップ
-# ==============================
-@tasks.loop(seconds=30)
-async def cleanup_task():
-    now = datetime.now(timezone.utc).timestamp()
-    interval_sec = config.SPAM["interval_ms"] / 1000
-    for user_id in list(message_history.keys()):
-        history = message_history[user_id]
-        history["timestamps"] = [
-            t for t in history["timestamps"] if now - t < interval_sec
-        ]
-        if not history["timestamps"]:
-            del message_history[user_id]
-    for guild_id in list(raid_lockdown.keys()):
-        if raid_lockdown[guild_id] < now:
-            del raid_lockdown[guild_id]
+@tree.command(name="userinfo", description="指定したユーザーのアカウント・サーバー参加情報を表示します")
+@app_commands.describe(target="情報を確認したいメンバー")
+async def userinfo_command(interaction: discord.Interaction, target: discord.Member = None):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ このコマンドはサーバー内でのみ実行できます。", ephemeral=True)
+        return
+
+    member = target or interaction.user
+    now = datetime.now(timezone.utc)
+
+    created_at = member.created_at
+    created_days = (now - created_at).days
+    
+    joined_at = member.joined_at
+    joined_days = (now - joined_at).days if joined_at else "不明"
+
+    roles = [role.mention for role in member.roles if role != interaction.guild.default_role]
+    roles_str = ", ".join(roles) if roles else "なし"
+
+    warning_flag = "⚠️ **作成直後のアカウント (7日以内)**" if created_days <= 7 else "✅ 正常"
+
+    embed = discord.Embed(
+        title=f"👤 ユーザー情報: {member.display_name}",
+        color=member.color if member.color != discord.Color.default() else discord.Color.blue()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="ユーザー名 / ID", value=f"{member} (`{member.id}`)", inline=False)
+    embed.add_field(name="アカウント作成日", value=f"<t:{int(created_at.timestamp())}:F>\n({created_days} 日前)", inline=True)
+    
+    if joined_at:
+        embed.add_field(name="サーバー参加日", value=f"<t:{int(joined_at.timestamp())}:F>\n({joined_days} 日前)", inline=True)
+    
+    embed.add_field(name="アカウント状態", value=warning_flag, inline=False)
+    embed.add_field(name=f"保有ロール ({len(roles)})", value=roles_str, inline=False)
+    embed.set_footer(text=f"Requested by {interaction.user}", icon_url=interaction.user.display_avatar.url)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@tree.command(name="lockdown", description="現在のチャンネル（またはサーバー全体）の発言権限を緊急ロック/解除します")
+@app_commands.checks.has_permissions(manage_channels=True)
+@app_commands.describe(
+    action="ロック（発言禁止）または 解除（発言許可）",
+    scope="適用範囲（このチャンネルのみ / サーバー全体）"
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="🔒 ロックダウン実行", value="lock"),
+        app_commands.Choice(name="🔓 ロックダウン解除", value="unlock")
+    ],
+    scope=[
+        app_commands.Choice(name="このチャンネルのみ", value="channel"),
+        app_commands.Choice(name="サーバー全体のテキストチャンネル", value="server")
+    ]
+)
+async def lockdown_command(
+    interaction: discord.Interaction, 
+    action: app_commands.Choice[str], 
+    scope: app_commands.Choice[str]
+):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ このコマンドはサーバー内でのみ実行できます。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    is_lock = (action.value == "lock")
+    send_messages_perm = False if is_lock else None
+
+    target_channels = []
+    if scope.value == "channel":
+        target_channels.append(interaction.channel)
+    else:
+        target_channels = [ch for ch in interaction.guild.text_channels]
+
+    updated_count = 0
+    for ch in target_channels:
+        try:
+            overwrite = ch.overwrites_for(interaction.guild.default_role)
+            overwrite.send_messages = send_messages_perm
+            await ch.set_permissions(interaction.guild.default_role, overwrite=overwrite)
+            updated_count += 1
+            
+            try:
+                if is_lock:
+                    await ch.send("🔒 **このチャンネルは現在ロックダウンされています（発言権限停止中）。**")
+                else:
+                    await ch.send("🔓 **ロックダウンが解除されました。**")
+            except Exception:
+                pass
+        except Exception:
+            continue
+
+    status_text = "ロックダウン（発言禁止）" if is_lock else "ロックダウン解除"
+    await interaction.followup.send(f"✅ {updated_count} 個のチャンネルで `{status_text}` を実行しました。", ephemeral=True)
+
+    await send_action_log(
+        guild=interaction.guild,
+        title=f"{'🔒' if is_lock else '🔓'} 緊急ロックダウン実行",
+        user=interaction.user,
+        reason=f"範囲: {scope.name} / 処理: {status_text}",
+        color=discord.Color.red() if is_lock else discord.Color.green()
+    )
+
+
+# ==========================================
+# 起動処理
+# ==========================================
 if __name__ == "__main__":
-    if not TOKEN:
-        raise SystemExit("DISCORD_TOKEN が設定されていません。.env を確認してください。")
-
-    if os.getenv("PORT"):
-        from keep_alive import keep_alive
-
-        keep_alive()
-
-    bot.run(TOKEN)
+    TOKEN = os.getenv("DISCORD_TOKEN")
+    if TOKEN:
+        bot.run(TOKEN)
+    else:
+        print("エラー: DISCORD_TOKEN の環境変数が設定されていません。")
